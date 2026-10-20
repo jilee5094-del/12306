@@ -547,6 +547,10 @@ public class TicketServiceImpl extends ServiceImpl<TicketMapper, TicketDO> imple
     @Override
     public void cancelTicketOrder(CancelTicketOrderReqDTO requestParam) {
         Result<Void> cancelOrderResult = ticketOrderRemoteService.cancelTicketOrder(requestParam);
+        if (!cancelOrderResult.isSuccess()) {
+            // 订单服务 CAS 失败（已支付/已关闭/并发重复取消）：如实返回失败，且不释放座位
+            throw new ServiceException(cancelOrderResult.getMessage());
+        }
         if (cancelOrderResult.isSuccess() && !StrUtil.equals(ticketAvailabilityCacheUpdateType, "binlog")) {
             Result<org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO> ticketOrderDetailResult = ticketOrderRemoteService.queryTicketOrderByOrderSn(requestParam.getOrderSn());
             org.opengoofy.index12306.biz.ticketservice.remote.dto.TicketOrderDetailRespDTO ticketOrderDetail = ticketOrderDetailResult.getData();

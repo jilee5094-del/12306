@@ -24,6 +24,7 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cloud.openfeign.EnableFeignClients;
 import org.springframework.retry.annotation.EnableRetry;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 12306 聚合服务应用启动器
@@ -38,6 +39,7 @@ import org.springframework.retry.annotation.EnableRetry;
         "org.opengoofy.index12306.biz.aggregationservice"
 })
 @EnableRetry
+@EnableScheduling
 @MapperScan(value = {
         "org.opengoofy.index12306.biz.userservice.dao.mapper",
         "org.opengoofy.index12306.biz.ticketservice.dao.mapper",

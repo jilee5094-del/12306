@@ -1,0 +1,16 @@
+ALTER TABLE t_order_0 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_1 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_2 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_3 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_4 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_5 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_6 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_7 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_8 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_9 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_10 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_11 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_12 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_13 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_14 ADD INDEX idx_status_order_time (status, order_time);
+ALTER TABLE t_order_15 ADD INDEX idx_status_order_time (status, order_time);

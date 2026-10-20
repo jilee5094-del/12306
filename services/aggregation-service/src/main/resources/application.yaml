@@ -102,3 +102,11 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+
+order:
+  reconcile:
+    # 超时订单对账补偿：延时关单消息丢失时兜底关单
+    enabled: true
+    interval-ms: 60000
+    timeout-minutes: 15
+    batch-size: 100

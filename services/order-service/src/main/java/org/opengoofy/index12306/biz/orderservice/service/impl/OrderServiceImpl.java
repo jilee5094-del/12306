@@ -19,7 +19,6 @@ package org.opengoofy.index12306.biz.orderservice.service.impl;
 
 import cn.crane4j.annotation.AutoOperate;
 import cn.hutool.core.collection.ListUtil;
-import cn.hutool.core.text.StrBuilder;
 import com.alibaba.fastjson2.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
@@ -56,14 +55,11 @@ import org.opengoofy.index12306.biz.orderservice.service.OrderPassengerRelationS
 import org.opengoofy.index12306.biz.orderservice.service.OrderService;
 import org.opengoofy.index12306.biz.orderservice.service.orderid.OrderIdGeneratorManager;
 import org.opengoofy.index12306.framework.starter.common.toolkit.BeanUtil;
-import org.opengoofy.index12306.framework.starter.convention.exception.ClientException;
 import org.opengoofy.index12306.framework.starter.convention.exception.ServiceException;
 import org.opengoofy.index12306.framework.starter.convention.page.PageResponse;
 import org.opengoofy.index12306.framework.starter.convention.result.Result;
 import org.opengoofy.index12306.framework.starter.database.toolkit.PageUtil;
 import org.opengoofy.index12306.frameworks.starter.user.core.UserContext;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -84,7 +80,6 @@ public class OrderServiceImpl implements OrderService {
     private final OrderItemMapper orderItemMapper;
     private final OrderItemService orderItemService;
     private final OrderPassengerRelationService orderPassengerRelationService;
-    private final RedissonClient redissonClient;
     private final DelayCloseOrderSendProduce delayCloseOrderSendProduce;
     private final UserRemoteService userRemoteService;
 
@@ -189,94 +184,74 @@ public class OrderServiceImpl implements OrderService {
         return orderSn;
     }
 
+    /**
+     * 订单从"待支付"迁移到目标状态（CAS）：UPDATE ... WHERE order_sn = ? AND status = 待支付。
+     * 返回 true 表示本次调用赢得迁移，只有赢家才能执行释放座位等后续动作；
+     * 延时关单、对账补偿、用户取消、支付回调并发到达时由数据库行锁保证只有一方成功。
+     */
+    private boolean transitFromPending(String orderSn, int targetStatus, int targetItemStatus) {
+        OrderDO updateOrderDO = new OrderDO();
+        updateOrderDO.setStatus(targetStatus);
+        LambdaUpdateWrapper<OrderDO> updateWrapper = Wrappers.lambdaUpdate(OrderDO.class)
+                .eq(OrderDO::getOrderSn, orderSn)
+                .eq(OrderDO::getStatus, OrderStatusEnum.PENDING_PAYMENT.getStatus());
+        if (orderMapper.update(updateOrderDO, updateWrapper) <= 0) {
+            return false;
+        }
+        OrderItemDO updateOrderItemDO = new OrderItemDO();
+        updateOrderItemDO.setStatus(targetItemStatus);
+        LambdaUpdateWrapper<OrderItemDO> updateItemWrapper = Wrappers.lambdaUpdate(OrderItemDO.class)
+                .eq(OrderItemDO::getOrderSn, orderSn)
+                .eq(OrderItemDO::getStatus, OrderItemStatusEnum.PENDING_PAYMENT.getStatus());
+        if (orderItemMapper.update(updateOrderItemDO, updateItemWrapper) <= 0) {
+            throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_ERROR);
+        }
+        return true;
+    }
+
     @Transactional(rollbackFor = Exception.class)
     @Override
     public boolean closeTickOrder(CancelTicketOrderReqDTO requestParam) {
-        String orderSn = requestParam.getOrderSn();
-        LambdaQueryWrapper<OrderDO> queryWrapper = Wrappers.lambdaQuery(OrderDO.class)
-                .eq(OrderDO::getOrderSn, orderSn)
-                .select(OrderDO::getStatus);
-        OrderDO orderDO = orderMapper.selectOne(queryWrapper);
-        if (Objects.isNull(orderDO) || orderDO.getStatus() != OrderStatusEnum.PENDING_PAYMENT.getStatus()) {
-            return false;
-        }
-        // 原则上订单关闭和订单取消这两个方法可以复用，为了区分未来考虑到的场景，这里对方法进行拆分但复用逻辑
-        return cancelTickOrder(requestParam);
+        // 延时消息与对账补偿共用；false 表示订单已支付或已被关闭，调用方不得再释放座位
+        return transitFromPending(requestParam.getOrderSn(), OrderStatusEnum.CLOSED.getStatus(), OrderItemStatusEnum.CLOSED.getStatus());
     }
 
     @Transactional(rollbackFor = Exception.class)
     @Override
     public boolean cancelTickOrder(CancelTicketOrderReqDTO requestParam) {
         String orderSn = requestParam.getOrderSn();
-        LambdaQueryWrapper<OrderDO> queryWrapper = Wrappers.lambdaQuery(OrderDO.class)
-                .eq(OrderDO::getOrderSn, orderSn);
-        OrderDO orderDO = orderMapper.selectOne(queryWrapper);
+        if (transitFromPending(orderSn, OrderStatusEnum.CLOSED.getStatus(), OrderItemStatusEnum.CLOSED.getStatus())) {
+            return true;
+        }
+        OrderDO orderDO = orderMapper.selectOne(Wrappers.lambdaQuery(OrderDO.class)
+                .eq(OrderDO::getOrderSn, orderSn)
+                .select(OrderDO::getStatus));
         if (orderDO == null) {
             throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_UNKNOWN_ERROR);
-        } else if (orderDO.getStatus() != OrderStatusEnum.PENDING_PAYMENT.getStatus()) {
-            throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_STATUS_ERROR);
         }
-        RLock lock = redissonClient.getLock(StrBuilder.create("order:canal:order_sn_").append(orderSn).toString());
-        if (!lock.tryLock()) {
-            throw new ClientException(OrderCanalErrorCodeEnum.ORDER_CANAL_REPETITION_ERROR);
-        }
-        try {
-            OrderDO updateOrderDO = new OrderDO();
-            updateOrderDO.setStatus(OrderStatusEnum.CLOSED.getStatus());
-            LambdaUpdateWrapper<OrderDO> updateWrapper = Wrappers.lambdaUpdate(OrderDO.class)
-                    .eq(OrderDO::getOrderSn, orderSn);
-            int updateResult = orderMapper.update(updateOrderDO, updateWrapper);
-            if (updateResult <= 0) {
-                throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_ERROR);
-            }
-            OrderItemDO updateOrderItemDO = new OrderItemDO();
-            updateOrderItemDO.setStatus(OrderItemStatusEnum.CLOSED.getStatus());
-            LambdaUpdateWrapper<OrderItemDO> updateItemWrapper = Wrappers.lambdaUpdate(OrderItemDO.class)
-                    .eq(OrderItemDO::getOrderSn, orderSn);
-            int updateItemResult = orderItemMapper.update(updateOrderItemDO, updateItemWrapper);
-            if (updateItemResult <= 0) {
-                throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_ERROR);
-            }
-        } finally {
-            lock.unlock();
-        }
-        return true;
+        // 并发取消时只有一个请求能迁移成功，其余请求明确失败，避免重复释放座位与余票
+        throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_STATUS_ERROR);
     }
 
     @Override
     public void statusReversal(OrderStatusReversalDTO requestParam) {
-        LambdaQueryWrapper<OrderDO> queryWrapper = Wrappers.lambdaQuery(OrderDO.class)
-                .eq(OrderDO::getOrderSn, requestParam.getOrderSn());
-        OrderDO orderDO = orderMapper.selectOne(queryWrapper);
+        String orderSn = requestParam.getOrderSn();
+        if (transitFromPending(orderSn, requestParam.getOrderStatus(), requestParam.getOrderItemStatus())) {
+            return;
+        }
+        OrderDO orderDO = orderMapper.selectOne(Wrappers.lambdaQuery(OrderDO.class)
+                .eq(OrderDO::getOrderSn, orderSn)
+                .select(OrderDO::getStatus));
         if (orderDO == null) {
             throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_UNKNOWN_ERROR);
-        } else if (orderDO.getStatus() != OrderStatusEnum.PENDING_PAYMENT.getStatus()) {
-            throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_CANAL_STATUS_ERROR);
         }
-        RLock lock = redissonClient.getLock(StrBuilder.create("order:status-reversal:order_sn_").append(requestParam.getOrderSn()).toString());
-        if (!lock.tryLock()) {
-            log.warn("订单重复修改状态，状态反转请求参数：{}", JSON.toJSONString(requestParam));
+        if (Objects.equals(orderDO.getStatus(), requestParam.getOrderStatus())) {
+            // 重复的支付结果消息：已是目标状态，幂等返回，避免 MQ 无限重试
+            log.info("[订单状态反转] 订单号：{} 已是目标状态 {}，忽略重复消息", orderSn, orderDO.getStatus());
+            return;
         }
-        try {
-            OrderDO updateOrderDO = new OrderDO();
-            updateOrderDO.setStatus(requestParam.getOrderStatus());
-            LambdaUpdateWrapper<OrderDO> updateWrapper = Wrappers.lambdaUpdate(OrderDO.class)
-                    .eq(OrderDO::getOrderSn, requestParam.getOrderSn());
-            int updateResult = orderMapper.update(updateOrderDO, updateWrapper);
-            if (updateResult <= 0) {
-                throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_STATUS_REVERSAL_ERROR);
-            }
-            OrderItemDO orderItemDO = new OrderItemDO();
-            orderItemDO.setStatus(requestParam.getOrderItemStatus());
-            LambdaUpdateWrapper<OrderItemDO> orderItemUpdateWrapper = Wrappers.lambdaUpdate(OrderItemDO.class)
-                    .eq(OrderItemDO::getOrderSn, requestParam.getOrderSn());
-            int orderItemUpdateResult = orderItemMapper.update(orderItemDO, orderItemUpdateWrapper);
-            if (orderItemUpdateResult <= 0) {
-                throw new ServiceException(OrderCanalErrorCodeEnum.ORDER_STATUS_REVERSAL_ERROR);
-            }
-        } finally {
-            lock.unlock();
-        }
+        // 典型场景：用户恰好在超时边界付款，订单已被关闭 —— 收款成功但订单不可履约，需要退款或人工处理
+        log.error("[订单状态反转] 订单号：{} 当前状态 {}，支付成功但订单已不可支付，需退款处理", orderSn, orderDO.getStatus());
     }
 
     @Override
